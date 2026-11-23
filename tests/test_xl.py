@@ -386,6 +386,11 @@ class XLTest(unittest.TestCase):
         self.assertGreater(float(chunked.blocks[0].local_attn.mass_bias.network[0].weight.grad.abs().sum()), 0)
         self.assertGreater(float(chunked.blocks[0].local_attn.complement_bias.network[0].weight.grad.abs().sum()), 0)
 
+        # Inference compacts the remote keys but keeps the same attention edges.
+        chunked.eval()
+        with torch.inference_mode():
+            torch.testing.assert_close(chunked(**batch), first, atol=1e-6, rtol=1e-5)
+
         # Query chunking also preserves full short-spectrum attention.
         attention = chunked.blocks[0].local_attn.eval()
         attention.full_limit = 32

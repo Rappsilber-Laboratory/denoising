@@ -106,6 +106,7 @@ def run_inference(config, root):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu") if name == "auto" else torch.device(name)
     torch.set_num_threads(int(runtime.get("cpu_num_threads", 8)))
     model.to(device).eval()
+    training_config = checkpoint["config"]["training"]
     override = config.get("evaluation", {}).get("threshold")
     threshold = float(override) if override is not None else float(checkpoint["threshold"])
     if not 0 <= threshold <= 1:
@@ -131,7 +132,11 @@ def run_inference(config, root):
             score_writer = csv.writer(score_handle) if score_handle else None
             if score_writer:
                 score_writer.writerow(["spectrum_index", "peak_index", "mz", "intensity", "score", "kept"])
-            with destination.open("w") as mgf, report.open("w", newline="") as report_handle:
+            with (
+                destination.open("w") as mgf,
+                report.open("w", newline="") as report_handle,
+                amp_context(device, training_config),
+            ):
                 report_writer = csv.writer(report_handle)
                 report_writer.writerow(["spectrum_index", "title", "scan", "input_peaks", "kept_peaks", "retained_intensity_fraction"])
                 for params, peaks in iter_mgf(path):
@@ -143,22 +148,23 @@ def run_inference(config, root):
                         continue
                     sample, order, last_scan = build_sample(peaks, params, features, normalizer, history, last_scan)
                     batch = xl_collate([sample])
-                    with amp_context(device, checkpoint["config"]["training"]):
-                        logits = model(**model_inputs(batch, device))
+                    logits = model(**model_inputs(batch, device))
                     scores_sorted = logits.float().sigmoid()[0].cpu().numpy()
                     scores = np.empty_like(scores_sorted)
                     scores[order] = scores_sorted
                     keep = scores >= threshold
                     # Neither minimum-kept-peaks nor an intensity fallback changes
                     # the validated decision rule without being evaluated first.
-                    write_spectrum(mgf, params, peaks[keep])
+                    retained_peaks = peaks[keep]
+                    write_spectrum(mgf, params, retained_peaks)
                     report_writer.writerow([n_spectra, metadata.get("TITLE", ""), last_scan,
-                         len(peaks), int(keep.sum()), float(peaks[keep, 1].sum() / max(float(peaks[:, 1].sum()), 1e-12))])
+                         len(peaks), len(retained_peaks),
+                         float(retained_peaks[:, 1].sum() / max(float(peaks[:, 1].sum()), 1e-12))])
                     if score_writer:
                         for j, ((mz, intensity), score, selected) in enumerate(zip(peaks, scores, keep)):
                             score_writer.writerow([n_spectra, j, mz, intensity, float(score), bool(selected)])
                     total_peaks += len(peaks)
-                    kept_peaks += int(keep.sum())
+                    kept_peaks += len(retained_peaks)
                     n_spectra += 1
                     if n_spectra % 100 == 0:
                         print(f"{path.name}: {n_spectra} spectra", flush=True)
